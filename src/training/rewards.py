@@ -3,9 +3,7 @@ import re
 
 from src.config.config import PipelineConfig
 
-
 _TODO_RE = re.compile(r"\b(TODO|FIXME|XXX)\b")
-
 
 def compute_group_advantages(rewards: list[float]) -> list[float]:
     """
@@ -73,6 +71,8 @@ def compute_correctness_reward(test_result: dict, source: str, cfg: PipelineConf
             test_result.get("pass_to_pass_total", 0),
         )
     else:
+        if not test_result.get("required_workflow_followed", False):
+            return 0.0
         raw = compute_codecontests_correctness(
             test_result.get("tests_passed", 0),
             test_result.get("tests_total", 0),
@@ -189,9 +189,22 @@ def tool_hygiene_reward(tool_call_history: list[dict]) -> float:
     return -redundant / len(tool_call_history)
 
 
-def test_discipline_reward(ran_tests_before_finish: bool) -> float:
-    """+1 if the agent executed the test suite before finishing; 0 otherwise."""
-    return 1.0 if ran_tests_before_finish else 0.0
+def test_discipline_reward(agent_ran_verification: bool) -> float:
+    """+1 for explicit verification, -1 when the agent skips verification entirely."""
+    return 1.0 if agent_ran_verification else -1.0
+
+
+def workflow_adherence_reward(rollout_meta: dict) -> float:
+    """
+    Reward strict adherence to the CodeContests tool workflow.
+
+    Returns 0.0 for sources that do not specify workflow metadata, +1.0 when
+    the required `write_file(solution.py)` -> verification flow was followed,
+    and -1.0 otherwise.
+    """
+    if "required_workflow_followed" not in rollout_meta:
+        return 0.0
+    return 1.0 if rollout_meta.get("required_workflow_followed", False) else -1.0
 
 
 def compute_auxiliary_rewards(rollout_meta: dict, cfg: PipelineConfig) -> dict[str, float]:
@@ -203,7 +216,7 @@ def compute_auxiliary_rewards(rollout_meta: dict, cfg: PipelineConfig) -> dict[s
           "modified_files": set[str],
           "task_relevant_files": set[str],
           "tool_call_history": [{"name": ..., "arguments": ...}, ...],
-          "ran_tests_before_finish": bool,
+          "agent_ran_verification": bool,
         }
 
     :returns: dict with per-component values and `"total_weighted"` key.
@@ -216,14 +229,15 @@ def compute_auxiliary_rewards(rollout_meta: dict, cfg: PipelineConfig) -> dict[s
         rollout_meta.get("task_relevant_files", set()),
     )
     hygiene = tool_hygiene_reward(rollout_meta.get("tool_call_history", []))
-    discipline = test_discipline_reward(rollout_meta.get("ran_tests_before_finish", False))
+    discipline = test_discipline_reward(rollout_meta.get("agent_ran_verification", False))
+    workflow = workflow_adherence_reward(rollout_meta)
 
     total = (
         cfg.reward.aux_syntax_weight * syntax
         + cfg.reward.aux_no_todo_weight * no_todo
         + cfg.reward.aux_minimal_diff_weight * minimal
-        + cfg.reward.aux_tool_hygiene_weight * hygiene
-        + cfg.reward.aux_test_discipline_weight * discipline
+        + cfg.reward.aux_tool_hygiene_weight * (hygiene + workflow)
+        + cfg.reward.aux_test_discipline_weight * (discipline + workflow)
     )
     return {
         "syntax": syntax,
@@ -231,5 +245,6 @@ def compute_auxiliary_rewards(rollout_meta: dict, cfg: PipelineConfig) -> dict[s
         "minimal_diff": minimal,
         "tool_hygiene": hygiene,
         "test_discipline": discipline,
+        "workflow_adherence": workflow,
         "total_weighted": total,
     }

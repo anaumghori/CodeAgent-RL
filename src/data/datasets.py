@@ -6,12 +6,12 @@ from datasets import load_dataset
 from huggingface_hub import login as hf_login
 
 from src.config.config import PipelineConfig
+from src.helpers import log_event
 
 
 @dataclass
 class TrainingStreams:
     swe_v2: Any
-    swe_prs: Any
     codecontests: Any
     held_out_swe_ids: set[str]  # set of held-out instance IDs that must be skipped during training.
 
@@ -24,7 +24,10 @@ class EvalSubsets:
 
 def _hf_authenticate(cfg: PipelineConfig) -> None:
     if cfg.credentials.hf_token:
+        log_event("datasets", "Authenticating with Hugging Face Hub using HF_TOKEN.")
         hf_login(token=cfg.credentials.hf_token, add_to_git_credential=False)
+    else:
+        log_event("datasets", "HF_TOKEN not set; continuing without explicit Hugging Face login.")
 
 
 def load_eval_subsets(cfg: PipelineConfig) -> EvalSubsets:
@@ -37,6 +40,7 @@ def load_eval_subsets(cfg: PipelineConfig) -> EvalSubsets:
     :returns: `EvalSubsets` dataclass with two fixed lists.
     """
     _hf_authenticate(cfg)
+    log_event("datasets", "Loading evaluation subsets from streaming datasets.")
     rng = random.Random(cfg.data.eval_seed)
 
     cc_valid_stream = load_dataset(
@@ -73,6 +77,10 @@ def load_eval_subsets(cfg: PipelineConfig) -> EvalSubsets:
         flat.extend(items)
     rng.shuffle(flat)
     swe_subset = flat[: cfg.eval.eval_swe_count]
+    log_event(
+        "datasets",
+        f"Prepared eval subsets: codecontests={len(cc_subset)}, swe={len(swe_subset)}.",
+    )
 
     return EvalSubsets(codecontests_valid=cc_subset, swe_held_out=swe_subset)
 
@@ -84,18 +92,20 @@ def load_training_streams(cfg: PipelineConfig, eval_subsets: EvalSubsets) -> Tra
     """
     _hf_authenticate(cfg)
     held_out_ids = {ex["instance_id"] for ex in eval_subsets.swe_held_out}
+    log_event(
+        "datasets",
+        f"Loading training streams with {len(held_out_ids)} held-out SWE instances excluded.",
+    )
 
     swe_v2 = load_dataset(cfg.data.swe_rebench_v2_id, split="train", streaming=True)
-    swe_prs = load_dataset(cfg.data.swe_rebench_v2_prs_id, split="train", streaming=True)
     codecontests = load_dataset(cfg.data.codecontests_o_id, split="train", streaming=True)
+    log_event("datasets", "Training streams are ready.")
 
     return TrainingStreams(
         swe_v2=swe_v2,
-        swe_prs=swe_prs,
         codecontests=codecontests,
         held_out_swe_ids=held_out_ids,
     )
-
 
 def codecontests_difficulty(example: dict) -> float:
     """
@@ -104,7 +114,6 @@ def codecontests_difficulty(example: dict) -> float:
     """
     desc = example.get("description", "") or ""
     return min(1.0, len(desc) / 9000.0)
-
 
 def swe_difficulty(example: dict) -> float:
     """

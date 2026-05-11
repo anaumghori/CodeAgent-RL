@@ -33,10 +33,6 @@ class PackedMicrobatch:
     rank: int
 
 
-def _pad_to(values: list, length: int, pad_value) -> list:
-    return values + [pad_value] * (length - len(values))
-
-
 def pack_sequences(
     sequences: list[TrainingSequence],
     num_ranks: int,
@@ -97,7 +93,8 @@ def pack_sequences(
             attention = torch.tensor([attn], dtype=torch.long)
             # The loss applies to predictions of positions 1..T-1, length T-1.
             loss_mask = torch.tensor([s.loss_mask[1:T]], dtype=torch.float32)
-            old_lp = torch.tensor([_pad_to(s.old_logprobs, T - 1, 0.0)], dtype=torch.float32)
+            padded_lp = s.old_logprobs + [0.0] * (T - 1 - len(s.old_logprobs))
+            old_lp = torch.tensor([padded_lp], dtype=torch.float32)
             adv = torch.tensor([s.advantage], dtype=torch.float32)
             microbatches.append(PackedMicrobatch(
                 input_ids=input_ids,

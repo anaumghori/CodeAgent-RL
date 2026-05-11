@@ -8,7 +8,6 @@ from src.data.datasets import TrainingStreams, codecontests_difficulty, swe_diff
 
 
 SOURCE_SWE_V2 = "swe_v2"
-SOURCE_SWE_PRS = "swe_prs"
 SOURCE_CODECONTESTS = "codecontests"
 
 
@@ -45,8 +44,13 @@ def _format_codecontests_prompt(ex: dict) -> str:
     desc = ex.get("description", "")
     return (
         f"Problem: {name}\n\n{desc}\n\n"
+        "Workflow requirements:\n"
+        "1. Use `write_file` to create `solution.py` containing the full runnable Python solution.\n"
+        "2. Use `run_command` to execute `python solution.py` against the provided sample cases before finishing.\n"
+        "3. Only provide a final answer after both steps above are complete.\n"
+        "4. Do not put the solution code only in the final message; the code must be written to `solution.py` via the tool.\n\n"
         "Read input from stdin and write the answer to stdout. "
-        "Implement, test against the provided sample cases, and submit your final solution."
+        "The rollout is incomplete unless `solution.py` is created and verified through tools."
     )
 
 
@@ -65,7 +69,6 @@ class PromptQueue:
         self.streams = streams
         self._iters = {
             SOURCE_SWE_V2: iter(streams.swe_v2),
-            SOURCE_SWE_PRS: iter(streams.swe_prs),
             SOURCE_CODECONTESTS: iter(streams.codecontests),
         }
         self._lock = threading.Lock()
@@ -74,6 +77,7 @@ class PromptQueue:
         self._task_stats: dict[str, tuple[int, int]] = {}
         self._replay_queue: deque[Prompt] = deque()
         self._rng = random.Random(0)
+        self._warm_start_prompt_count = 2
 
 
     def restore_position(self, global_index: int) -> None:
@@ -116,16 +120,19 @@ class PromptQueue:
 
     def _current_mix(self, step: int) -> dict[str, float]:
         """Return source -> sampling weight for the current curriculum stage."""
+        if self.global_index < self._warm_start_prompt_count:
+            return {
+                SOURCE_CODECONTESTS: 1.0,
+                SOURCE_SWE_V2: 0.0,
+            }
         if step < self.cfg.curriculum.stage1_end_step:
             mix = self.cfg.curriculum.stage1_mix
             return {
                 SOURCE_CODECONTESTS: mix.get("codecontests", 0.0),
                 SOURCE_SWE_V2: mix.get("swe_v2", 0.0),
-                SOURCE_SWE_PRS: mix.get("swe_prs", 0.0),
             }
         return {
             SOURCE_SWE_V2: self.cfg.data.mix_swe_v2_weight,
-            SOURCE_SWE_PRS: self.cfg.data.mix_swe_prs_weight,
             SOURCE_CODECONTESTS: self.cfg.data.mix_codecontests_weight,
         }
 
@@ -140,11 +147,11 @@ class PromptQueue:
 
     def _build_prompt(self, source: str, ex: dict) -> Prompt | None:
         """Convert a raw dataset row into a `Prompt`, returning None to skip."""
-        if source in (SOURCE_SWE_V2, SOURCE_SWE_PRS):
+        if source == SOURCE_SWE_V2:
             instance_id = ex.get("instance_id", "")
             if not instance_id:
                 return None
-            if source == SOURCE_SWE_V2 and instance_id in self.streams.held_out_swe_ids:
+            if instance_id in self.streams.held_out_swe_ids:
                 return None
             return Prompt(
                 prompt_id=f"{source}:{instance_id}",
@@ -216,6 +223,4 @@ class PromptQueue:
             return prompt
 
 
-    def next_batch(self, step: int, count: int) -> list[Prompt]:
-        """Convenience: pull `count` prompts in sequence."""
-        return [self.next_prompt(step) for _ in range(count)]
+

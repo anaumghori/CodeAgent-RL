@@ -4,9 +4,10 @@ import uuid
 from dataclasses import dataclass, field
 
 from src.config.config import PipelineConfig
-from src.data.prompt_queue import Prompt
+from src.data.prompt_queue import Prompt, SOURCE_CODECONTESTS
 from src.environments.base import Environment
-from src.environments.tools import TOOL_DEFINITIONS
+from src.environments.tools import TOOL_DEFINITIONS, normalize_tool_arguments
+from src.helpers import log_event, log_json
 from src.inference.vllm_server import VLLMServer
 
 
@@ -83,7 +84,6 @@ class RolloutGenerator:
     prompt + task + summary + the most recent turns.
     """
 
-
     def __init__(self, cfg: PipelineConfig, server: VLLMServer, tokenizer) -> None:
         self.cfg = cfg
         self.server = server
@@ -91,26 +91,40 @@ class RolloutGenerator:
         self.max_turns = 24
 
 
-    def _sampling_params(self):
+    def _sampling_params(self, prompt: Prompt):
         from vllm import SamplingParams
+        max_tokens = self.cfg.sequence.max_generation_tokens
+        if prompt.source == SOURCE_CODECONTESTS:
+            max_tokens = self.cfg.sequence.codecontests_max_generation_tokens
         return SamplingParams(
             temperature=self.cfg.sampling.temperature,
             top_p=self.cfg.sampling.top_p,
             top_k=self.cfg.sampling.top_k,
-            max_tokens=self.cfg.sequence.max_generation_tokens,
+            max_tokens=max_tokens,
             logprobs=1,
         )
 
 
     def _build_initial_messages(self, prompt: Prompt) -> list[dict]:
         """ChatML messages with explicit Hermes thinking instructions."""
+        system_prompt = (
+            f"{THINKING_SYSTEM_PROMPT}\n\n"
+            "You are an expert software engineer. Use the provided tools to inspect code, "
+            "run commands, write fixes, and verify your work with the test suite."
+        )
+        if prompt.source == SOURCE_CODECONTESTS:
+            system_prompt = (
+                f"{THINKING_SYSTEM_PROMPT}\n\n"
+                "You are solving a competitive programming task inside a strict tool-using harness. "
+                "You must use tools to complete the task. The required order is: "
+                "(1) use `write_file` to create `solution.py`, "
+                "(2) use `run_command` to execute and verify `solution.py`, "
+                "(3) only then provide a brief final response. "
+                "Do not treat a prose answer or a markdown code block as a valid solution submission. "
+                "If `solution.py` has not been written and verified through tools, the task is incomplete."
+            )
         return [
-            {"role": "system",
-             "content": (
-                 f"{THINKING_SYSTEM_PROMPT}\n\n"
-                 "You are an expert software engineer. Use the provided tools to inspect code, "
-                 "run commands, write fixes, and verify your work with the test suite."
-             )},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt.task_text},
         ]
 
@@ -124,9 +138,9 @@ class RolloutGenerator:
         return text, ids
 
 
-    def _generate(self, messages: list[dict]) -> tuple[str, list[int], list[float]]:
+    def _generate(self, prompt: Prompt, messages: list[dict]) -> tuple[str, list[int], list[float]]:
         """Run one generation call; return (text, generated_token_ids, per-token logprobs)."""
-        sp = self._sampling_params()
+        sp = self._sampling_params(prompt)
         outputs = self.server.llm.chat(messages=messages, sampling_params=sp,
                                        tools=TOOL_DEFINITIONS)
         out0 = outputs[0].outputs[0]
@@ -155,6 +169,10 @@ class RolloutGenerator:
             except json.JSONDecodeError:
                 continue
             if isinstance(payload, dict) and "name" in payload:
+                try:
+                    payload["arguments"] = normalize_tool_arguments(payload.get("arguments", {}))
+                except (TypeError, json.JSONDecodeError):
+                    continue
                 calls.append(payload)
         return calls
 
@@ -171,12 +189,12 @@ class RolloutGenerator:
         return think, text
 
 
-    def _summarize(self, messages: list[dict]) -> tuple[str, list[int], list[float]]:
+    def _summarize(self, prompt: Prompt, messages: list[dict]) -> tuple[str, list[int], list[float]]:
         msgs = list(messages) + [{
             "role": "user",
             "content": SUMMARY_PROMPT,
         }]
-        return self._generate(msgs)
+        return self._generate(prompt, msgs)
 
 
     def _segment_visible_tokens(self, segment: RolloutSegment) -> int:
@@ -208,9 +226,14 @@ class RolloutGenerator:
             source=prompt.source,
             policy_version=policy_version,
         )
+        log_event(
+            "rollout",
+            f"Starting rollout {rollout.rollout_id} for prompt {prompt.prompt_id} "
+            f"(source={prompt.source}, policy_version={policy_version}).",
+        )
 
         messages = self._build_initial_messages(prompt)
-        prompt_text, prompt_ids = self._render(messages)
+        _, prompt_ids = self._render(messages)
         segment = RolloutSegment(
             token_ids=list(prompt_ids),
             loss_mask=[0] * len(prompt_ids),
@@ -218,7 +241,7 @@ class RolloutGenerator:
         )
 
         for turn in range(self.max_turns):
-            text, gen_ids, logprobs = self._generate(messages)
+            text, gen_ids, logprobs = self._generate(prompt, messages)
             think, visible = self._strip_thinking(text)
             tool_calls = self._parse_tool_calls(visible)
 
@@ -243,11 +266,20 @@ class RolloutGenerator:
 
             if not tool_calls:
                 rollout.final_response = visible.strip()
+                if hasattr(env, "record_final_response"):
+                    env.record_final_response(rollout.final_response)
                 break
 
             for tc in tool_calls:
                 rollout.n_tool_calls += 1
                 result = env.dispatch_tool(tc["name"], tc.get("arguments", {}))
+                if not result.success:
+                    preview = " ".join((result.output or "").split())[:240]
+                    log_event(
+                        "rollout",
+                        f"Tool {tc['name']} failed during rollout {rollout.rollout_id} "
+                        f"(turn={turn + 1}): {preview}",
+                    )
                 tool_msg = {"role": "tool", "name": tc["name"], "content": result.output}
                 messages.append(tool_msg)
                 # Re-render to get the tokenized representation of the tool response only.
@@ -262,7 +294,12 @@ class RolloutGenerator:
 
             if self._should_trigger_summary(segment):
                 # Close current segment, generate summary, start a new segment.
-                summary, summary_ids, summary_logprobs = self._summarize(messages)
+                log_event(
+                    "rollout",
+                    f"Triggering self-summary for rollout {rollout.rollout_id} "
+                    f"after turn {turn + 1} (segment={len(rollout.segments) + 1}).",
+                )
+                summary, summary_ids, summary_logprobs = self._summarize(prompt, messages)
                 segment.token_ids.extend(summary_ids)
                 segment.loss_mask.extend([1] * len(summary_ids))
                 segment.logprobs.extend(summary_logprobs)
@@ -281,6 +318,19 @@ class RolloutGenerator:
                 )
 
         rollout.segments.append(segment)
+        log_json(
+            "rollout",
+            "rollout_complete",
+            {
+                "rollout_id": rollout.rollout_id,
+                "prompt_id": rollout.prompt_id,
+                "source": rollout.source,
+                "turns": rollout.n_turns,
+                "tool_calls": rollout.n_tool_calls,
+                "segments": len(rollout.segments),
+                "total_tokens": sum(len(s.token_ids) for s in rollout.segments),
+            },
+        )
         return rollout
 
 
@@ -291,10 +341,13 @@ class RolloutGenerator:
         instance, since environments hold mutable state).
         """
         rollouts: list[Rollout] = []
-        for _ in range(self.cfg.grpo.group_size):
+        for idx in range(self.cfg.grpo.group_size):
             env = env_factory()
             try:
-                env.setup()
+                already_prepared = bool(getattr(env, "_composer_prepared", False))
+                if not already_prepared:
+                    env.setup()
+                    setattr(env, "_composer_prepared", True)
                 rollout = self._run_single_rollout(prompt, env, policy_version)
                 rollout.test_result = env.run_tests()
                 rollout.metadata = env.collect_metadata()

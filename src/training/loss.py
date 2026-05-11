@@ -1,6 +1,5 @@
 import torch
 
-
 def compute_per_token_logprobs(logits: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
     """
     Compute log π(a_t | s_t) for every position. Logits at position t predict
@@ -16,7 +15,6 @@ def compute_per_token_logprobs(logits: torch.Tensor, input_ids: torch.Tensor) ->
     log_probs = torch.log_softmax(shifted_logits, dim=-1)
     return log_probs.gather(dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
 
-
 def compute_grpo_loss(
     logits: torch.Tensor,
     input_ids: torch.Tensor,
@@ -27,13 +25,6 @@ def compute_grpo_loss(
     clip_epsilon: float = 0.2,
 ) -> tuple[torch.Tensor, dict]:
     """
-    Dr. GRPO loss for a single microbatch.
-
-    Implements the clipped surrogate objective with the k₁ KL estimator
-    (-log r) and unbiased token-level normalisation: the loss is divided by
-    the total number of model-generated tokens in the batch (no per-response
-    length normalisation, no group std normalisation).
-
     :param logits: (B, T, V) model output.
     :param input_ids: (B, T) token IDs.
     :param old_logprobs: (B, T-1) log-probs from the sampling policy.

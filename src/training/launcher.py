@@ -5,7 +5,8 @@ import tempfile
 from multiprocessing.connection import Listener, Connection
 from pathlib import Path
 
-from src.config.config import PipelineConfig
+from src.config.config import PipelineConfig, TRAINER_WORLD_SIZE
+from src.helpers import log_event
 
 
 IPC_SOCKET_ENV = "COMPOSER_RL_IPC_SOCKET"
@@ -17,12 +18,12 @@ class TrainerLauncher:
     Spawn the DeepSpeed trainer worker subprocesses (one per rank). Each rank gets 
     its own `CUDA_VISIBLE_DEVICES` mapping so that rank N sees a single device 
     which is globally GPU N. The orchestrator parent must already have set 
-    `CUDA_VISIBLE_DEVICES=2` before any CUDA import so vLLM ends up on global GPU 2
+    `CUDA_VISIBLE_DEVICES=2` before any CUDA import so vLLM ends up on global GPU 2.
     """
 
     def __init__(self, cfg: PipelineConfig) -> None:
         self.cfg = cfg
-        self.world_size = cfg.infra.num_training_gpus
+        self.world_size = TRAINER_WORLD_SIZE
         socket_dir = Path(tempfile.mkdtemp(prefix="composer-rl-ipc-"))
         self.socket_path = str(socket_dir / "trainer.sock")
         self.listener: Listener | None = None
@@ -50,6 +51,10 @@ class TrainerLauncher:
         rank 0 on the Unix-domain socket. Returns the live `Connection` to
         rank 0; the caller must close it on shutdown.
         """
+        log_event(
+            "trainer_launcher",
+            f"Starting trainer subprocesses with world_size={self.world_size}.",
+        )
         self.listener = Listener(address=self.socket_path, family="AF_UNIX")
         for rank in range(self.world_size):
             proc = subprocess.Popen(
@@ -60,6 +65,7 @@ class TrainerLauncher:
         # Only rank 0 connects to the IPC listener; other ranks operate purely
         # via torch.distributed collectives.
         self.connection = self.listener.accept()
+        log_event("trainer_launcher", "Trainer rank 0 connected to IPC socket.")
         return self.connection
 
 
@@ -70,6 +76,7 @@ class TrainerLauncher:
 
     def shutdown(self) -> None:
         """Tear down the IPC listener and reap the trainer subprocesses."""
+        log_event("trainer_launcher", "Shutting down trainer subprocesses.")
         if self.connection is not None:
             try:
                 self.connection.close()

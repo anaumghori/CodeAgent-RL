@@ -30,6 +30,20 @@ class RecoveryCheckpointer:
         self.local_root.mkdir(parents=True, exist_ok=True)
 
 
+    def _require_hf_checkpoint_repo(self) -> str:
+        """
+        Return the configured Hugging Face checkpoint repo and fail loudly when
+        it is missing.
+        """
+        repo = self.cfg.checkpoint.hf_checkpoint_repo
+        if repo:
+            return repo
+        raise RuntimeError(
+            "Checkpoint sync requires cfg.checkpoint.hf_checkpoint_repo to be set. "
+            "Set HF_USERNAME in .env or override checkpoint.hf_checkpoint_repo explicitly."
+        )
+
+
     def save(
         self,
         checkpoint_number: int,
@@ -52,12 +66,13 @@ class RecoveryCheckpointer:
             with open(save_dir / CLIENT_STATE_FILE, "w") as f:
                 json.dump(client_state, f, indent=2)
             if push_to_hub:
-                self.api.create_repo(self.cfg.checkpoint.hf_checkpoint_repo,
+                repo_id = self._require_hf_checkpoint_repo()
+                self.api.create_repo(repo_id,
                                      repo_type="model", exist_ok=True, private=True)
                 self.api.upload_folder(
                     folder_path=str(save_dir),
                     path_in_repo=tag,
-                    repo_id=self.cfg.checkpoint.hf_checkpoint_repo,
+                    repo_id=repo_id,
                     repo_type="model",
                 )
         if dist.is_initialized():
@@ -73,10 +88,11 @@ class RecoveryCheckpointer:
         """
         local_dir = self.local_root / checkpoint_tag
         if self.rank == 0 and not local_dir.exists():
+            repo_id = self._require_hf_checkpoint_repo()
             snapshot_download(
-                repo_id=self.cfg.checkpoint.hf_checkpoint_repo,
+                repo_id=repo_id,
                 allow_patterns=[f"{checkpoint_tag}/*"],
-                local_dir=str(self.local_root.parent),
+                local_dir=str(self.local_root),
                 token=self.cfg.credentials.hf_token or None,
             )
         if dist.is_initialized():

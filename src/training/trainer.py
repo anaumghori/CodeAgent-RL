@@ -9,7 +9,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from src.config.config import PipelineConfig
 from src.config.deepspeed_config import build_deepspeed_config
 from src.data.sequence_packing import TrainingSequence, pack_sequences, PackedMicrobatch
-from src.helpers import gpu_memory_gb, timed
+from src.helpers import gpu_memory_snapshot, reset_gpu_peak_memory, timed
 from src.inference.rollout import RolloutGroup
 from src.training.loss import compute_grpo_loss
 
@@ -81,10 +81,7 @@ class Trainer:
         self._max_seq_length: int = cfg.sequence.max_training_seq_length
 
 
-    def _capture_weight_transfer_metadata(
-        self,
-        model,
-    ) -> tuple[list[str], list[str], list[tuple[int, ...]]]:
+    def _capture_weight_transfer_metadata(self, model) -> tuple[list[str], list[str], list[tuple[int, ...]]]:
         """
         Capture the full parameter metadata before DeepSpeed ZeRO-3 wraps the
         model. vLLM expects the metadata passed to `update_weights` to match
@@ -140,6 +137,8 @@ class Trainer:
             "mean_rollout_length": sum(token_counts) / n,
             "mean_turns": sum(turns) / n,
             "correctness_rate": correctness_hits / n,
+            "num_rollouts": len(rewards),
+            "num_sequences": len(sequences),
         }
         return sequences, stats
 
@@ -288,6 +287,9 @@ class Trainer:
         self.update_max_sequence_length()
         timing: dict = {}
         stats: dict = {}
+        device = next(self.engine.module.parameters()).device
+        if torch.cuda.is_available():
+            reset_gpu_peak_memory(device)
 
         with timed(timing, "step_time_sec"):
             if self.rank == 0:
@@ -321,7 +323,9 @@ class Trainer:
         averaged["train/learning_rate"] = self.scheduler.get_last_lr()[0]
 
         if self.rank == 0:
-            a0, r0 = gpu_memory_gb(0)
-            averaged["resource/gpu_train_memory_allocated_gb"] = a0
-            averaged["resource/gpu_train_memory_reserved_gb"] = r0
+            mem = gpu_memory_snapshot(0)
+            averaged["resource/gpu_train_memory_allocated_gb"] = mem["allocated_gb"]
+            averaged["resource/gpu_train_memory_reserved_gb"] = mem["reserved_gb"]
+            averaged["resource/gpu_train_max_memory_allocated_gb"] = mem["max_allocated_gb"]
+            averaged["resource/gpu_train_max_memory_reserved_gb"] = mem["max_reserved_gb"]
         return averaged

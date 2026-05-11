@@ -1,3 +1,4 @@
+import json
 import subprocess
 from pathlib import Path
 
@@ -137,22 +138,37 @@ def tool_list_directory(workspace: Path, path: str) -> ToolResult:
     return ToolResult(output="\n".join(entries))
 
 
-def dispatch_tool_call(workspace: Path, name: str, arguments: dict) -> ToolResult:
+def normalize_tool_arguments(arguments: dict | str | None) -> dict:
     """
-    Dispatch a parsed tool call to its implementation.
+    Normalize tool-call arguments into a JSON object. Hermes occasionally
+    emits the outer tool-call payload correctly while stringifying the nested
+    `arguments` field, so accept that form too.
+    """
+    if arguments is None:
+        return {}
+    if isinstance(arguments, dict):
+        return arguments
+    if isinstance(arguments, str):
+        payload = json.loads(arguments)
+        if isinstance(payload, dict):
+            return payload
+        raise TypeError(
+            f"Tool arguments JSON must decode to an object, got {type(payload).__name__}."
+        )
+    raise TypeError(f"Tool arguments must be a dict or JSON string, got {type(arguments).__name__}.")
 
-    :param workspace: Filesystem root where the tools operate.
-    :param name: Tool name.
-    :param arguments: Parsed JSON arguments.
-    """
+
+def dispatch_tool_call(workspace: Path, name: str, arguments: dict | str | None) -> ToolResult:
+    """Dispatch a parsed tool call to its implementation."""
+    normalized = normalize_tool_arguments(arguments)
     if name == "read_file":
-        return tool_read_file(workspace, arguments["path"])
+        return tool_read_file(workspace, normalized["path"])
     if name == "write_file":
-        return tool_write_file(workspace, arguments["path"], arguments["content"])
+        return tool_write_file(workspace, normalized["path"], normalized["content"])
     if name == "run_command":
-        return tool_run_command(workspace, arguments["command"], int(arguments.get("timeout", 60)))
+        return tool_run_command(workspace, normalized["command"], int(normalized.get("timeout", 60)))
     if name == "search_code":
-        return tool_search_code(workspace, arguments["pattern"], arguments.get("path"))
+        return tool_search_code(workspace, normalized["pattern"], normalized.get("path"))
     if name == "list_directory":
-        return tool_list_directory(workspace, arguments["path"])
+        return tool_list_directory(workspace, normalized["path"])
     return ToolResult(output=f"Unknown tool: {name}", success=False)

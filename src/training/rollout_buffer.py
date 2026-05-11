@@ -1,8 +1,8 @@
 import threading
+import time
 from collections import deque
 
 from src.inference.rollout import RolloutGroup
-
 
 class RolloutBuffer:
     """
@@ -21,6 +21,7 @@ class RolloutBuffer:
         self._not_full = threading.Condition(self._lock)
         self._not_empty = threading.Condition(self._lock)
         self._dropped = 0
+        self._underruns = 0
 
 
     def push(self, group: RolloutGroup, timeout: float | None = None) -> None:
@@ -36,21 +37,31 @@ class RolloutBuffer:
     def pull(self, count: int, current_version: int, timeout: float | None = None) -> list[RolloutGroup]:
         """
         Pull up to `count` non-stale groups. Stale groups (older than `max_staleness` versions) are silently 
-        dropped from the front. Blocks until at least one valid group is available.
+        dropped from the front. Waits for the requested batch size whenever possible and
+        only returns a partial batch once `timeout` expires.
         """
-        out: list[RolloutGroup] = []
+        deadline = None if timeout is None else time.monotonic() + timeout
         with self._not_empty:
             while True:
                 while self._buffer and self._buffer[0].policy_version + self.max_staleness < current_version:
                     self._buffer.popleft()
                     self._dropped += 1
-                while self._buffer and len(out) < count:
-                    out.append(self._buffer.popleft())
-                if out:
+                if len(self._buffer) >= count:
+                    out = [self._buffer.popleft() for _ in range(count)]
                     self._not_full.notify_all()
                     return out
-                if not self._not_empty.wait(timeout=timeout):
-                    return out
+                if deadline is not None and time.monotonic() >= deadline:
+                    if self._buffer:
+                        out = []
+                        while self._buffer and len(out) < count:
+                            out.append(self._buffer.popleft())
+                        self._not_full.notify_all()
+                        self._underruns += 1
+                        return out
+                    self._underruns += 1
+                    return []
+                wait_timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
+                self._not_empty.wait(timeout=wait_timeout)
 
 
     def depth(self) -> int:
@@ -64,6 +75,14 @@ class RolloutBuffer:
             d = self._dropped
             self._dropped = 0
             return d
+
+
+    def pop_underruns(self) -> int:
+        """Return and reset the count of `pull` calls that timed out empty."""
+        with self._lock:
+            u = self._underruns
+            self._underruns = 0
+            return u
 
 
     def unblock_consumers(self) -> None:

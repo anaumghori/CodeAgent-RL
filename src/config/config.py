@@ -6,6 +6,9 @@ import yaml
 
 from dotenv import load_dotenv
 
+TRAINER_WORLD_SIZE = 2
+INFERENCE_GPU_ID = 2
+
 
 @dataclass
 class ModelConfig:
@@ -14,8 +17,6 @@ class ModelConfig:
     """
     model_name: str = "NousResearch/Hermes-4-14B"
     dtype: str = "bfloat16"
-    max_position_embeddings: int = 40960
-    vocab_size: int = 151936
 
 
 @dataclass
@@ -26,8 +27,6 @@ class TrainingConfig:
     total_steps: int = 2000
     warmup_steps: int = 100
     learning_rate: float = 1e-6
-    lr_schedule: str = "cosine"
-    optimizer: str = "adamw"
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     weight_decay: float = 0.01
@@ -42,8 +41,8 @@ class TrainingConfig:
 class SequenceConfig:
     """Maximum lengths and self-summarization triggers."""
     max_training_seq_length: int = 4096
-    max_rollout_length: int = 32768
     max_generation_tokens: int = 8192
+    codecontests_max_generation_tokens: int = 4096
     summary_soft_trigger_tokens: int = 10000
     summary_hard_trigger_tokens: int = 12000
     summary_context_turns: int = 2
@@ -55,9 +54,6 @@ class GRPOConfig:
     group_size: int = 4
     ppo_clip_epsilon: float = 0.2
     kl_coefficient: float = 0.02
-    kl_estimator: str = "k1"
-    normalize_advantages_by_std: bool = False
-    overlong_masking: bool = False
     max_policy_staleness: int = 2
 
 
@@ -89,13 +85,10 @@ class RewardConfig:
 class DataConfig:
     """Dataset identifiers, mix ratios, and curriculum-related defaults."""
     swe_rebench_v2_id: str = "nebius/SWE-rebench-V2"
-    swe_rebench_v2_prs_id: str = "nebius/SWE-rebench-V2-PRs"
     codecontests_o_id: str = "caijanfeng/CodeContests-O"
-    mix_swe_v2_weight: float = 0.55
-    mix_swe_prs_weight: float = 0.15
+    mix_swe_v2_weight: float = 0.70
     mix_codecontests_weight: float = 0.30
     hard_task_upsample_factor: float = 2.0
-    eval_subset_size: int = 50
     eval_seed: int = 42
 
 
@@ -120,21 +113,17 @@ class EvalConfig:
 class LoggingConfig:
     """Weights & Biases tracking configuration."""
     wandb_project: str = "composer-rl"
-    wandb_entity: str = ""
     log_interval: int = 1
 
 
 @dataclass
 class InfraConfig:
     """GPU layout, vLLM behaviour, and rollout-buffer/environment-pool sizes."""
-    num_training_gpus: int = 2
-    inference_gpu_id: int = 2
     num_environment_workers: int = 16
     vllm_gpu_memory_utilization: float = 0.90
     vllm_max_model_len: int = 32768
     vllm_enable_prefix_caching: bool = True
     rollout_buffer_max_groups: int = 50
-    env_prewarming_pool_size: int = 8
     weight_sync_master_address: str = "127.0.0.1"
     weight_sync_master_port: int = 29600
     trainer_dist_master_port: int = 29500
@@ -144,11 +133,7 @@ class InfraConfig:
 class CurriculumConfig:
     """Stage boundaries and per-stage dataset mixes."""
     stage1_end_step: int = 200
-    stage2_end_step: int = 900
     stage1_mix: dict = field(default_factory=lambda: {"codecontests": 0.5, "swe_v2": 0.5})
-    stage2_mix: dict = field(
-        default_factory=lambda: {"swe_v2": 0.55, "swe_prs": 0.15, "codecontests": 0.30}
-    )
     seq_length_extension_step: int = 500
     extended_max_training_seq_length: int = 8192
     hard_task_success_threshold: float = 0.5
@@ -159,10 +144,17 @@ class CredentialsConfig:
     """Container holding credentials loaded from a `.env` file at process start."""
     hf_token: str = ""
     wandb_api_key: str = ""
-    modal_token_id: str = ""
-    modal_token_secret: str = ""
     hf_username: str = ""
-    wandb_username: str = ""
+
+
+@dataclass
+class ModalConfig:
+    """
+    Settings governing the Modal sandbox resources used by SWE rollouts.
+    """
+    sandbox_cpus: float = 2.0
+    sandbox_memory_mb: int = 4096
+    sandbox_timeout_seconds: int = 1800
 
 
 @dataclass
@@ -184,6 +176,7 @@ class PipelineConfig:
     infra: InfraConfig = field(default_factory=InfraConfig)
     curriculum: CurriculumConfig = field(default_factory=CurriculumConfig)
     credentials: CredentialsConfig = field(default_factory=CredentialsConfig)
+    modal: ModalConfig = field(default_factory=ModalConfig)
 
 
     @property
@@ -192,7 +185,7 @@ class PipelineConfig:
         return (
             self.training.micro_batch_size
             * self.training.gradient_accumulation_steps
-            * self.infra.num_training_gpus
+            * TRAINER_WORLD_SIZE
         )
 
 
@@ -226,11 +219,7 @@ def load_config(yaml_path: str | Path | None = None) -> PipelineConfig:
     cfg = PipelineConfig()
     cfg.credentials.hf_token = os.environ.get("HF_TOKEN", "")
     cfg.credentials.wandb_api_key = os.environ.get("WANDB_API_KEY", "")
-    cfg.credentials.modal_token_id = os.environ.get("MODAL_TOKEN_ID", "")
-    cfg.credentials.modal_token_secret = os.environ.get("MODAL_TOKEN_SECRET", "")
     cfg.credentials.hf_username = os.environ.get("HF_USERNAME", "")
-    cfg.credentials.wandb_username = os.environ.get("WANDB_USERNAME", "")
-    cfg.logging.wandb_entity = os.environ.get("WANDB_USERNAME", "")
     if cfg.credentials.hf_username:
         cfg.checkpoint.hf_checkpoint_repo = (
             f"{cfg.credentials.hf_username}/composer-rl-checkpoints"

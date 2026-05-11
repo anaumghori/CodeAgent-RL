@@ -1,4 +1,4 @@
-import time
+import copy
 
 from src.config.config import PipelineConfig
 from src.data.datasets import EvalSubsets
@@ -11,7 +11,7 @@ from src.data.prompt_queue import (
 )
 from src.environments.codecontests_env import CodeContestsEnvironment
 from src.environments.swe_env import SWEEnvironment
-from src.helpers import timed
+from src.helpers import log_event, timed
 from src.inference.rollout import RolloutGenerator
 from src.inference.vllm_server import VLLMServer
 from src.training.rewards import (
@@ -40,7 +40,9 @@ class Evaluator:
         self.tokenizer = tokenizer
         self.subsets = eval_subsets
         self.logger = logger
-        self.generator = RolloutGenerator(cfg, server, tokenizer)
+        eval_cfg = copy.deepcopy(cfg)
+        eval_cfg.sampling.temperature = eval_cfg.sampling.eval_temperature
+        self.generator = RolloutGenerator(eval_cfg, server, tokenizer)
 
 
     def _eval_codecontests(self) -> dict:
@@ -93,7 +95,7 @@ class Evaluator:
                 task_text=_format_swe_prompt(ex),
                 payload=ex,
             )
-            env = SWEEnvironment(ex, source=SOURCE_SWE_V2,
+            env = SWEEnvironment(ex, source=SOURCE_SWE_V2, cfg=self.cfg,
                                  test_timeout=self.cfg.reward.test_timeout_seconds)
             env.setup()
             try:
@@ -122,18 +124,13 @@ class Evaluator:
 
     def run(self, training_step: int) -> dict:
         """Execute both evaluation subsets and log all results at `training_step`."""
-        # Force greedy decoding for reproducibility.
-        original_temp = self.cfg.sampling.temperature
-        self.cfg.sampling.temperature = self.cfg.sampling.eval_temperature
         timing: dict = {}
-        try:
-            with timed(timing, "eval_total_time_sec"):
-                with timed(timing, "eval_codecontests_time_sec"):
-                    cc = self._eval_codecontests()
-                with timed(timing, "eval_swe_time_sec"):
-                    swe = self._eval_swe()
-        finally:
-            self.cfg.sampling.temperature = original_temp
+        log_event("evaluator", f"Starting evaluation at training_step={training_step}.")
+        with timed(timing, "eval_total_time_sec"):
+            with timed(timing, "eval_codecontests_time_sec"):
+                cc = self._eval_codecontests()
+            with timed(timing, "eval_swe_time_sec"):
+                swe = self._eval_swe()
 
         merged = {**cc, **swe}
         merged["eval/mean_eval_turns"] = (
@@ -145,4 +142,10 @@ class Evaluator:
         for k, v in timing.items():
             merged[f"timing/{k}"] = v
         self.logger.log(merged, step=training_step)
+        log_event(
+            "evaluator",
+            f"Completed evaluation at training_step={training_step}: "
+            f"codecontests_pass_rate={merged['eval/codecontests_pass_rate']:.3f}, "
+            f"swe_resolve_rate={merged['eval/swe_resolve_rate']:.3f}.",
+        )
         return merged

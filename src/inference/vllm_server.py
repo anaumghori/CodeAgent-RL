@@ -1,6 +1,7 @@
 import threading
 
 from src.config.config import PipelineConfig
+from src.helpers import gpu_memory_snapshot, log_event
 
 
 class VLLMServer:
@@ -23,6 +24,12 @@ class VLLMServer:
         from vllm import LLM
         from vllm.config import WeightTransferConfig
 
+        log_event(
+            "vllm",
+            f"Starting vLLM for model={self.cfg.model.model_name}, dtype={self.cfg.model.dtype}, "
+            f"max_model_len={self.cfg.infra.vllm_max_model_len}, "
+            f"gpu_memory_utilization={self.cfg.infra.vllm_gpu_memory_utilization:.2f}.",
+        )
         self._llm = LLM(
             model=self.cfg.model.model_name,
             tensor_parallel_size=1,
@@ -32,6 +39,13 @@ class VLLMServer:
             enable_prefix_caching=self.cfg.infra.vllm_enable_prefix_caching,
             enable_sleep_mode=True,
             weight_transfer_config=WeightTransferConfig(backend="nccl"),
+        )
+        log_event("vllm", "vLLM server started.")
+        memory = gpu_memory_snapshot(0)
+        log_event(
+            "vllm",
+            f"Startup GPU memory: allocated={memory['allocated_gb']:.2f} GiB, "
+            f"reserved={memory['reserved_gb']:.2f} GiB.",
         )
 
 
@@ -48,12 +62,14 @@ class VLLMServer:
         state before a weight broadcast.
         """
         with self._lock:
+            log_event("vllm", "Pausing vLLM for weight sync.")
             self.llm.sleep(level=0, mode="keep")
             self.llm.reset_prefix_cache(reset_running_requests=True)
 
 
     def resume_after_weight_sync(self) -> None:
         with self._lock:
+            log_event("vllm", "Resuming vLLM after weight sync.")
             self.llm.wake_up(tags=["scheduling"])
 
 
@@ -74,6 +90,7 @@ class VLLMServer:
             if self._update_thread is not None:
                 raise RuntimeError("vLLM weight update already in progress.")
             self._update_error = []
+            log_event("vllm", f"Beginning weight update for {len(names)} tensors.")
             request = WeightTransferUpdateRequest(
                 update_info=dict(
                     names=names,
@@ -103,19 +120,9 @@ class VLLMServer:
         thread.join()
         if self._update_error:
             raise self._update_error[0]
-
-
-    def sleep_for_reload(self) -> None:
-        """Drop weights + KV cache so new weights can be received without OOM."""
-        self.llm.sleep(level=2)
-
-
-    def wake_after_reload(self) -> None:
-        """Restore weights then KV cache after a sleep-mode-style reload."""
-        self.llm.wake_up(tags=["weights"])
-        self.llm.collective_rpc("reload_weights")
-        self.llm.wake_up(tags=["kv_cache"])
+        log_event("vllm", "Weight update completed.")
 
 
     def shutdown(self) -> None:
+        log_event("vllm", "Shutting down vLLM server wrapper.")
         self._llm = None

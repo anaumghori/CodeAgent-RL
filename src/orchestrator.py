@@ -1,14 +1,18 @@
-import argparse
-import os
+import math
+import subprocess
 import threading
+from collections import deque
 from multiprocessing.connection import Connection
 
+from modal.exception import RemoteError
+
 from src.checkpointing.weight_sync import init_inference_weight_transfer
-from src.config.config import PipelineConfig, load_config
+from src.config.config import PipelineConfig
 from src.data.datasets import load_eval_subsets, load_training_streams
-from src.data.prompt_queue import PromptQueue
+from src.data.prompt_queue import PromptQueue, SOURCE_CODECONTESTS
 from src.environments.pool import EnvironmentPool, build_environment
-from src.helpers import gpu_memory_gb
+from src.environments.swe_env import METRICS as SWE_ENVIRONMENT_METRICS
+from src.helpers import format_exception, gpu_memory_snapshot, log_event, log_json
 from src.inference.rollout import RolloutGenerator, RolloutGroup
 from src.inference.vllm_server import VLLMServer
 from src.training.rewards import (
@@ -44,6 +48,7 @@ class Orchestrator:
         self.streams = load_training_streams(cfg, self.eval_subsets)
         self.prompt_queue = PromptQueue(cfg, self.streams)
         self.env_pool = EnvironmentPool(cfg)
+        self._env_build_failures: int = 0
         self.rollout_buffer = RolloutBuffer(
             max_groups=cfg.infra.rollout_buffer_max_groups,
             max_staleness=cfg.grpo.max_policy_staleness,
@@ -65,6 +70,7 @@ class Orchestrator:
         self._load_payload: tuple | None = None
         self._inference_error: BaseException | None = None
         self._dispatcher_error: BaseException | None = None
+        self._prompt_backlog: deque = deque()
         self.training_step: int = 0
         self.policy_version: int = 0
         self._client_state: dict = {
@@ -74,6 +80,37 @@ class Orchestrator:
             "curriculum_stage": 1,
             "wandb_run_id": None,
         }
+
+
+    def _prewarm_env_count(self, prompt) -> int:
+        """Return how many environments to prepare ahead of time for `prompt`."""
+        if prompt.source == SOURCE_CODECONTESTS:
+            return 1
+        return min(2, self.cfg.grpo.group_size)
+
+
+    def _schedule_env_prewarm(self, prompt) -> None:
+        """Submit background environment setup for an upcoming prompt."""
+        self.env_pool.submit(prompt, count=self._prewarm_env_count(prompt))
+
+
+    def _ensure_prompt_backlog(self, count: int) -> None:
+        """
+        Keep at least `count` prompts prefetched so environment setup can overlap
+        with training and inference.
+        """
+        while len(self._prompt_backlog) < count:
+            prompt = self.prompt_queue.next_prompt(self.training_step)
+            self._prompt_backlog.append(prompt)
+            self._schedule_env_prewarm(prompt)
+
+
+    def _next_prompt(self):
+        """Return the next prompt, prefetched when possible, and replenish the backlog."""
+        self._ensure_prompt_backlog(1)
+        prompt = self._prompt_backlog.popleft()
+        self._ensure_prompt_backlog(2)
+        return prompt
 
 
     def _compute_rewards_for_group(self, group: RolloutGroup) -> None:
@@ -105,7 +142,23 @@ class Orchestrator:
         advantages = compute_group_advantages(rewards)
         for rollout, adv in zip(group.rollouts, advantages):
             rollout.advantage = adv
+        reward_mean = sum(rewards) / max(1, len(rewards))
+        reward_variance = sum((reward - reward_mean) ** 2 for reward in rewards) / max(1, len(rewards))
+        reward_std = math.sqrt(reward_variance)
         success_rate = successes / max(1, len(group.rollouts))
+        log_json(
+            "orchestrator",
+            "group_reward_summary",
+            {
+                "prompt_id": group.prompt.prompt_id,
+                "source": group.prompt.source,
+                "success_rate": success_rate,
+                "reward_mean": reward_mean,
+                "reward_std": reward_std,
+                "reward_min": min(rewards) if rewards else 0.0,
+                "reward_max": max(rewards) if rewards else 0.0,
+            },
+        )
         if success_rate < self.cfg.curriculum.hard_task_success_threshold:
             self.prompt_queue.maybe_requeue_prompt(group.prompt, self.training_step)
 
@@ -116,13 +169,39 @@ class Orchestrator:
         assert gen is not None
         try:
             while not self._stop.is_set():
-                prompt = self.prompt_queue.next_prompt(self.training_step)
+                prompt = self._next_prompt()
                 self._client_state["prompt_index"] = self.prompt_queue.global_index
 
                 def env_factory(p=prompt):
-                    return build_environment(p, self.cfg)
+                    wait_timeout = 10.0 if p.source != SOURCE_CODECONTESTS else 1.0
+                    env = self.env_pool.acquire_for_prompt(p, timeout=wait_timeout)
+                    if env is not None:
+                        return env
+                    self.env_pool.claim_inline_build(p)
+                    success = False
+                    try:
+                        env = build_environment(p, self.cfg)
+                        env.setup()
+                        setattr(env, "_composer_prepared", True)
+                        success = True
+                        return env
+                    finally:
+                        self.env_pool.release_inline_build(p, success=success)
 
-                group = gen.generate_group(prompt, env_factory, self.policy_version)
+                # SWE rollouts can fail during environment setup (image pull,
+                # build, or git clone errors). Skip the prompt and continue
+                # rather than tearing down the inference loop, since these
+                # errors are per-instance and not pipeline-wide.
+                try:
+                    group = gen.generate_group(prompt, env_factory, self.policy_version)
+                except (subprocess.CalledProcessError, RuntimeError, OSError, RemoteError) as exc:
+                    self._env_build_failures += 1
+                    log_event(
+                        "orchestrator",
+                        f"Environment setup failed for prompt {prompt.prompt_id} "
+                        f"(source={prompt.source}): {exc}; skipping prompt.",
+                    )
+                    continue
                 self._compute_rewards_for_group(group)
                 self.rollout_buffer.push(group)
         except BaseException as exc:
@@ -131,6 +210,7 @@ class Orchestrator:
             self._inference_error = exc
             self._stop.set()
             self.rollout_buffer.unblock_consumers()
+            log_event("orchestrator", f"Inference loop failed:\n{format_exception(exc)}")
             raise
 
 
@@ -181,6 +261,7 @@ class Orchestrator:
             self._step_event.set()
             self._save_event.set()
             self._load_event.set()
+            log_event("orchestrator", f"IPC dispatcher failed:\n{format_exception(exc)}")
             raise
 
 
@@ -238,6 +319,10 @@ class Orchestrator:
         if step == 0 or step % self.cfg.eval.eval_interval != 0:
             return
         checkpoint_number = step // self.cfg.checkpoint.recovery_checkpoint_interval
+        log_event(
+            "orchestrator",
+            f"Starting checkpoint/evaluation cycle at step={step}, checkpoint_number={checkpoint_number}.",
+        )
         self._client_state.update({
             "training_step": step,
             "policy_version": self.policy_version,
@@ -248,12 +333,35 @@ class Orchestrator:
         self.evaluator.run(training_step=step)
 
 
+    def _environment_metrics(self) -> dict:
+        """Snapshot per-step Modal environment metrics for the W&B log payload."""
+        out = SWE_ENVIRONMENT_METRICS.snapshot_and_reset()
+        out["env/build_failures_cumulative"] = self._env_build_failures
+        return out
+
+
     def setup(self) -> None:
         """Materialise every component (vLLM, trainer subprocesses, evaluator) before training begins."""
+        log_event("orchestrator", "Starting setup().")
+        log_event("orchestrator", "Loading tokenizer.")
         self.tokenizer = load_tokenizer_only(self.cfg)
-        self.server.start()
+        server_error: list[BaseException] = []
+
+        def _start_server() -> None:
+            try:
+                self.server.start()
+            except BaseException as exc:
+                server_error.append(exc)
+
+        log_event("orchestrator", "Starting vLLM server and trainer subprocesses in parallel.")
+        server_thread = threading.Thread(target=_start_server, daemon=True)
+        server_thread.start()
         self.launcher = TrainerLauncher(self.cfg)
         self.ipc = self.launcher.start()
+        server_thread.join()
+        if server_error:
+            raise RuntimeError("vLLM server startup failed") from server_error[0]
+        log_event("orchestrator", "vLLM server and trainer subprocess launch completed.")
 
         # Handshake with rank 0: it tells us once DeepSpeed engine init is
         # complete; we then concurrently run NCCL inference init while rank 0
@@ -261,6 +369,7 @@ class Orchestrator:
         first = self.ipc.recv()
         if first != ("ds_init_done",):
             raise RuntimeError(f"Expected ds_init_done from trainer rank 0, got {first!r}")
+        log_event("orchestrator", "Trainer DeepSpeed initialization complete; starting NCCL handshake.")
 
         nccl_inference_thread = threading.Thread(
             target=lambda: init_inference_weight_transfer(self.cfg, self.server.llm),
@@ -272,6 +381,7 @@ class Orchestrator:
         if nccl_done != ("nccl_done",):
             raise RuntimeError(f"Expected nccl_done from trainer rank 0, got {nccl_done!r}")
         nccl_inference_thread.join()
+        log_event("orchestrator", "NCCL weight transfer channel is ready.")
 
         self.rollout_generator = RolloutGenerator(self.cfg, self.server, self.tokenizer)
         self.evaluator = Evaluator(self.cfg, self.server, self.tokenizer,
@@ -284,6 +394,7 @@ class Orchestrator:
 
         run_id = None
         if self.resume_from:
+            log_event("orchestrator", f"Resuming from checkpoint {self.resume_from}.")
             self._client_state = self._load_checkpoint(self.resume_from)
             self.training_step = self._client_state.get("training_step", 0)
             self.policy_version = self._client_state.get("policy_version", 0)
@@ -291,10 +402,13 @@ class Orchestrator:
             run_id = self._client_state.get("wandb_run_id")
 
         self.logger.init(run_id=run_id)
+        self._ensure_prompt_backlog(2)
+        log_event("orchestrator", "Setup complete.")
 
 
     def run(self) -> None:
         """Drive the training loop: feed groups to the trainer until the total step budget is reached."""
+        log_event("orchestrator", "Starting training loop.")
         inference_thread = threading.Thread(target=self._inference_loop, daemon=True)
         inference_thread.start()
 
@@ -309,19 +423,40 @@ class Orchestrator:
                 )
                 if not groups:
                     continue
+                log_event(
+                    "orchestrator",
+                    f"Dispatching {len(groups)} rollout groups to trainer at step={self.training_step}, "
+                    f"policy_version={self.policy_version}.",
+                )
                 metrics = self._run_training_step(groups)
-                # Metrics are already namespaced (`train/...`, `timing/...`,
                 # `resource/...`) by the trainer; do not re-prefix.
                 metrics["train/buffer_depth"] = self.rollout_buffer.depth()
                 metrics["train/staleness_drop_rate"] = self.rollout_buffer.pop_staleness_drops()
+                metrics["train/buffer_underruns"] = self.rollout_buffer.pop_underruns()
                 metrics["train/policy_version"] = self.policy_version
-                a, r = gpu_memory_gb(0)  # cuda:0 in the parent == global inference GPU
-                metrics["resource/gpu_inference_memory_allocated_gb"] = a
-                metrics["resource/gpu_inference_memory_reserved_gb"] = r
+                # cuda:0 in the parent == global inference GPU.
+                inference_mem = gpu_memory_snapshot(0)
+                metrics["resource/gpu_inference_memory_allocated_gb"] = inference_mem["allocated_gb"]
+                metrics["resource/gpu_inference_memory_reserved_gb"] = inference_mem["reserved_gb"]
+                metrics["resource/gpu_inference_max_memory_allocated_gb"] = inference_mem["max_allocated_gb"]
+                metrics["resource/gpu_inference_max_memory_reserved_gb"] = inference_mem["max_reserved_gb"]
+                metrics.update(self._environment_metrics())
                 if (self.training_step % self.cfg.logging.log_interval) == 0:
                     self.logger.log(metrics, step=self.training_step)
                 self._maybe_evaluate_and_checkpoint(metrics)
+                log_event(
+                    "orchestrator",
+                    f"Completed step {self.training_step}; policy_version={self.policy_version}; "
+                    f"loss={metrics.get('train/loss', 0.0):.4f}; "
+                    f"mean_reward={metrics.get('train/mean_reward', 0.0):.4f}; "
+                    f"step_time_sec={metrics.get('timing/step_time_sec', 0.0):.2f}; "
+                    f"buffer_depth={metrics.get('train/buffer_depth', 0.0):.0f}.",
+                )
+        except BaseException as exc:
+            log_event("orchestrator", f"Run loop failed:\n{format_exception(exc)}")
+            raise
         finally:
+            log_event("orchestrator", "Beginning orchestrator shutdown.")
             self._stop.set()
             try:
                 self._ipc_send(("shutdown",))
@@ -333,24 +468,3 @@ class Orchestrator:
             self.logger.finish()
             if self.launcher is not None:
                 self.launcher.shutdown()
-
-
-def main() -> None:
-    """CLI entry point for non-Modal launches (e.g. RunPod via `uv run`)."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default=None,
-                        help="Optional YAML override file path.")
-    parser.add_argument("--resume-from", type=str, default=None,
-                        help="Recovery checkpoint tag (e.g., checkpoint-14) to resume from.")
-    args = parser.parse_args()
-    cfg = load_config(args.config)
-    # Restrict the orchestrator parent to the inference GPU so vLLM ends up on
-    # it. Trainer subprocesses reset CUDA_VISIBLE_DEVICES to their own rank.
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(cfg.infra.inference_gpu_id)
-    orch = Orchestrator(cfg, resume_from=args.resume_from)
-    orch.setup()
-    orch.run()
-
-
-if __name__ == "__main__":
-    main()
